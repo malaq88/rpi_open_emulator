@@ -241,6 +241,8 @@ fn build_retroarch_command(
     let mut command = Command::new(&retroarch_binary);
     command.arg("--appendconfig").arg(&cfg_path);
     command.arg("-L").arg(&core_path);
+    // Inicia em tela cheia; argumentos extra em `retroarch.extra_args` podem sobrescrever (ex.: `--windowed`).
+    command.arg("--fullscreen");
     command.args(&config.retroarch.extra_args);
     command.args(&system.extra_args);
     command.arg(rom_path);
