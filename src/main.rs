@@ -1,22 +1,37 @@
-mod catalog;
 mod config;
+mod core;
 mod default_systems;
-mod launcher;
+mod plugins;
+mod product;
+mod state;
 mod theme;
+mod themes;
+mod ui;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
-use catalog::{Catalog, GameEntry};
 use config::{LauncherConfig, SystemConfig};
+use core::emulator::{RetroArchSessionResult, run_retroarch_blocking};
+use core::library::{Catalog, GameEntry};
+use core::scraper::ScraperPipeline;
 use directories::ProjectDirs;
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke};
+use plugins::PluginHost;
+use product::FeatureFlags;
+use state::filter_state::SidebarSection;
+use state::{AppState, AppView};
+use themes::ThemeId;
+use ui::components::search_bar;
+use ui::components::sidebar::{self, SidebarNavAction};
+use ui::screens::game_detail::{self, DetailCommand};
+use ui::screens::home::{self, HomeCommand};
+use ui::screens::library::{self, LibraryCommand};
 
 fn main() -> anyhow::Result<()> {
     migrate_legacy_data_if_needed()?;
@@ -29,14 +44,15 @@ fn main() -> anyhow::Result<()> {
     let scanned_count = catalog.sync_with_filesystem(&config).unwrap_or(0);
     let metadata_updated = catalog.refresh_metadata_cache(&config).unwrap_or(0);
     let games = catalog.list_games().unwrap_or_default();
-    let favorites = catalog.list_favorites().unwrap_or_default();
     let recent = catalog.list_recent(10).unwrap_or_default();
+    let recently_added = catalog.list_recently_added(16).unwrap_or_default();
+    let most_played = catalog.list_most_played(16).unwrap_or_default();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RPi Open Emulator")
             .with_app_id("dev.malack.rpi_open_emulator")
-            .with_min_inner_size([720.0, 520.0]),
+            .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()
     };
 
@@ -44,35 +60,41 @@ fn main() -> anyhow::Result<()> {
         "RPi Open Emulator",
         options,
         Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx);
+            themes::apply(&cc.egui_ctx, ThemeId::DefaultDark);
             let (game_done_tx, game_done_rx) = mpsc::channel();
             let settings_draft = SettingsDraft::from_config(&config);
             let initial_status = if config.library.roms_dir.exists() {
                 format!(
-                    "{} ROM(s) no catalogo ({} atualizada(s) no scan, {} com metadata)",
+                    "{} ROM(s) no catálogo ({} atualizada(s) no scan, {} com metadata)",
                     games.len(),
                     scanned_count,
                     metadata_updated
                 )
             } else {
                 format!(
-                    "Pasta de ROMs nao encontrada: {}",
+                    "Pasta de ROMs não encontrada: {}",
                     config.library.roms_dir.display()
                 )
             };
+            let mut plugin_host = PluginHost::default();
+            plugin_host.register_scraper_id("offline-cache");
+            let pipeline = ScraperPipeline::default();
             Box::new(LauncherApp {
                 config_path: config_path.clone(),
                 config,
                 catalog,
-                games,
-                favorites,
-                recent,
+                state: AppState::new(games, recent, recently_added, most_played),
                 status: initial_status,
-                active_view: AppView::Library,
                 settings_draft,
                 game_done_tx,
                 game_done_rx,
                 game_session_busy: false,
+                cover_texture_cache: HashMap::new(),
+                ui_theme: ThemeId::DefaultDark,
+                features: FeatureFlags::default(),
+                plugin_host,
+                scraper_pipeline: pipeline,
+                settings_tab: SettingsTab::default(),
             })
         }),
     )
@@ -122,22 +144,27 @@ struct LauncherApp {
     config_path: PathBuf,
     config: LauncherConfig,
     catalog: Catalog,
-    games: Vec<GameEntry>,
-    favorites: Vec<GameEntry>,
-    recent: Vec<GameEntry>,
+    state: AppState,
     status: String,
-    active_view: AppView,
     settings_draft: SettingsDraft,
-    game_done_tx: Sender<launcher::RetroArchSessionResult>,
-    game_done_rx: Receiver<launcher::RetroArchSessionResult>,
-    /// RetroArch está em execução (thread de espera ativa).
+    game_done_tx: Sender<RetroArchSessionResult>,
+    game_done_rx: Receiver<RetroArchSessionResult>,
     game_session_busy: bool,
+    cover_texture_cache: HashMap<PathBuf, egui::TextureHandle>,
+    ui_theme: ThemeId,
+    features: FeatureFlags,
+    plugin_host: PluginHost,
+    scraper_pipeline: ScraperPipeline,
+    settings_tab: SettingsTab,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppView {
-    Library,
-    Settings,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Interface,
+    LibraryPaths,
+    EmulatorCores,
+    Controls,
 }
 
 #[derive(Debug, Clone)]
@@ -192,91 +219,294 @@ impl SettingsDraft {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_retroarch_completion();
+        themes::apply(ctx, self.ui_theme);
 
         let mut panel_frame = Frame::central_panel(&ctx.style());
         panel_frame.fill = theme::BG_DEEP;
-        panel_frame.inner_margin = Margin::same(14.0);
+        panel_frame.inner_margin = Margin::same(12.0);
 
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
-                self.render_brand_header(ui);
-                ui.add_space(10.0);
-                self.render_control_bar(ui);
-                ui.add_space(8.0);
-                self.render_status_line(ui);
-                ui.add_space(12.0);
+                const APP_FOOTER_H: f32 = 44.0;
 
-                if self.active_view == AppView::Settings {
-                    Frame::none()
-                        .fill(theme::BG_CARD)
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(60, 72, 105)))
-                        .inner_margin(Margin::same(16.0))
-                        .show(ui, |ui| {
-                            ui.set_min_height(ui.available_height());
-                            self.render_settings_panel(ui);
-                        });
-                    return;
-                }
+                ui.vertical(|ui| {
+                    self.render_brand_header(ui);
+                    ui.add_space(8.0);
+                    self.render_status_line(ui);
+                    ui.add_space(10.0);
 
-                theme::section_heading(ui, "Recentes", theme::ACCENT);
-                if self.recent.is_empty() {
-                    ui.label(
-                        RichText::new("Nenhum jogo recente — abra um titulo na Biblioteca.")
-                            .color(theme::TEXT_DIM)
-                            .italics(),
+                    let w = ui.available_width();
+                    let mid_h = (ui.available_height() - APP_FOOTER_H).max(80.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(w, mid_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let counts =
+                                library::build_sidebar_counts(&self.state.games, &self.config);
+                            let sidebar_w = 232.0;
+                            let content_row_h = ui.available_height();
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(content_row_h);
+
+                                let mut nav = SidebarNavAction::None;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(sidebar_w, content_row_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        nav = Frame::none()
+                                            .fill(theme::BG_PANEL)
+                                            .rounding(Rounding::same(12.0))
+                                            .stroke(Stroke::new(1.0, Color32::from_white_alpha(25)))
+                                            .inner_margin(Margin::symmetric(10.0, 14.0))
+                                            .show(ui, |ui| {
+                                                ui.set_width(sidebar_w);
+                                                ui.set_min_height(ui.available_height());
+                                                sidebar::render_sidebar(
+                                                    ui,
+                                                    &mut self.state.filter,
+                                                    &counts,
+                                                    &self.state.selected_view,
+                                                )
+                                            })
+                                            .inner;
+                                    },
+                                );
+
+                                self.apply_sidebar_nav(nav);
+
+                                ui.add_space(12.0);
+
+                                ui.vertical(|ui| {
+                                    self.render_global_toolbar(ui, ctx);
+
+                                    match &self.state.selected_view {
+                                        AppView::Dashboard => {
+                                            let hcmds = home::render_home(
+                                                ui,
+                                                ctx,
+                                                &self.state.games,
+                                                &self.state.recent,
+                                                &self.state.recently_added,
+                                                &self.state.most_played,
+                                                &self.config,
+                                                &self.state.filter,
+                                                &mut self.cover_texture_cache,
+                                            );
+                                            self.handle_home_commands(ctx, hcmds);
+                                        }
+                                        AppView::Library => {
+                                            ui.set_min_height(ui.available_height());
+                                            let lcmds = library::render_library_grid(
+                                                ui,
+                                                ctx,
+                                                &self.state.games,
+                                                &self.state.recent,
+                                                &self.state.filter,
+                                                &mut self.cover_texture_cache,
+                                            );
+                                            self.handle_library_commands(ctx, lcmds);
+                                        }
+                                        AppView::GameDetail(path) => {
+                                            if let Some(game) = self
+                                                .state
+                                                .games
+                                                .iter()
+                                                .find(|g| g.path == *path)
+                                                .cloned()
+                                            {
+                                                if let Some(dc) =
+                                                    game_detail::render_game_detail(ui, &game)
+                                                {
+                                                    match dc {
+                                                        DetailCommand::Back => {
+                                                            self.state.selected_view =
+                                                                AppView::Library;
+                                                        }
+                                                        DetailCommand::Launch(g) => {
+                                                            self.launch_game(ctx, &g);
+                                                        }
+                                                        DetailCommand::Favorite(p, v) => {
+                                                            if let Some(g) = self
+                                                                .state
+                                                                .games
+                                                                .iter()
+                                                                .find(|gr| gr.path == p)
+                                                                .cloned()
+                                                            {
+                                                                self.set_favorite(&g, v);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Jogo não encontrado no catálogo.",
+                                                    )
+                                                    .color(theme::TEXT_DIM),
+                                                );
+                                                if theme::outline_button(ui, "Voltar", theme::ACCENT)
+                                                    .clicked()
+                                                {
+                                                    self.state.selected_view = AppView::Library;
+                                                }
+                                            }
+                                        }
+                                        AppView::Settings => {
+                                            Frame::none()
+                                                .fill(theme::BG_CARD)
+                                                .rounding(Rounding::same(10.0))
+                                                .stroke(Stroke::new(
+                                                    1.0,
+                                                    Color32::from_rgb(60, 72, 105),
+                                                ))
+                                                .inner_margin(Margin::same(16.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_height(ui.available_height());
+                                                    self.render_settings_panel(ui);
+                                                });
+                                        }
+                                    }
+                                });
+                            });
+                        },
                     );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_source("recent_scroll")
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            for game in self.recent.clone() {
-                                self.render_game_row(ui, &game);
-                            }
-                        });
-                }
 
-                theme::section_heading(ui, "Favoritos", theme::WARM);
-                if self.favorites.is_empty() {
-                    ui.label(
-                        RichText::new("Nenhum favorito — use a estrela na lista de jogos.")
-                            .color(theme::TEXT_DIM)
-                            .italics(),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_source("favorites_scroll")
-                        .max_height(170.0)
-                        .show(ui, |ui| {
-                            for game in self.favorites.clone() {
-                                self.render_game_row(ui, &game);
-                            }
-                        });
-                }
-
-                theme::section_heading(ui, "Biblioteca", theme::ACTION);
-                if self.games.is_empty() {
-                    ui.label(
-                        RichText::new("Nenhuma ROM compativel — verifique a pasta em Configuracoes.")
-                            .color(theme::TEXT_DIM)
-                            .italics(),
-                    );
-                    return;
-                }
-                egui::ScrollArea::vertical()
-                    .id_source("library_scroll")
-                    .show(ui, |ui| {
-                        for game in self.games.clone() {
-                            self.render_game_row(ui, &game);
-                        }
-                    });
+                    ui.add_space(6.0);
+                    self.render_app_footer(ui);
+                });
             });
     }
 }
 
 impl LauncherApp {
+    fn apply_sidebar_nav(&mut self, nav: SidebarNavAction) {
+        match nav {
+            SidebarNavAction::None => {}
+            SidebarNavAction::GoHome => {
+                self.state.selected_view = AppView::Dashboard;
+            }
+            SidebarNavAction::GoLibraryAll => {
+                self.state.selected_view = AppView::Library;
+                self.state.filter.section = SidebarSection::All;
+            }
+            SidebarNavAction::GoFavorites => {
+                self.state.selected_view = AppView::Library;
+                self.state.filter.section = SidebarSection::Favorites;
+            }
+            SidebarNavAction::GoRecent => {
+                self.state.selected_view = AppView::Library;
+                self.state.filter.section = SidebarSection::Recent;
+            }
+            SidebarNavAction::GoConsole(key) => {
+                self.state.selected_view = AppView::Library;
+                self.state.filter.section = SidebarSection::Console(key);
+            }
+            SidebarNavAction::GoSettings => {
+                self.state.selected_view = AppView::Settings;
+                self.settings_draft = SettingsDraft::from_config(&self.config);
+            }
+            SidebarNavAction::SyncLibrary => {
+                self.sync_library();
+            }
+            SidebarNavAction::RefreshMetadata => {
+                self.refresh_metadata();
+            }
+        }
+    }
+
+    fn render_global_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !matches!(
+            self.state.selected_view,
+            AppView::Dashboard | AppView::Library
+        ) {
+            return;
+        }
+
+        Frame::none()
+            .fill(theme::BG_CARD)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 58, 82)))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let search_id = egui::Id::new("global_search_field");
+                    if ctx.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.ctrl) {
+                        ctx.memory_mut(|m| m.request_focus(search_id));
+                    }
+                    let search_w = (ui.available_width() - 120.0).max(200.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(search_w, 40.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            search_bar::render_search_bar(
+                                ui,
+                                &mut self.state.filter.search_query,
+                                search_id,
+                            );
+                        },
+                    );
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        Frame::none()
+                            .fill(theme::UI_CARD_ELEVATED)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("{}", self.state.games.len()))
+                                        .strong()
+                                        .color(theme::TEXT_MAIN),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("jogos")
+                                        .small()
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+
+    fn handle_home_commands(&mut self, ctx: &egui::Context, cmds: Vec<HomeCommand>) {
+        for c in cmds {
+            match c {
+                HomeCommand::Launch(g) => self.launch_game(ctx, &g),
+                HomeCommand::Favorite(p, v) => {
+                    if let Some(g) = self.state.games.iter().find(|gr| gr.path == p).cloned() {
+                        self.set_favorite(&g, v);
+                    }
+                }
+                HomeCommand::OpenDetail(p) => {
+                    self.state.selected_view = AppView::GameDetail(p);
+                }
+            }
+        }
+    }
+
+    fn handle_library_commands(&mut self, ctx: &egui::Context, cmds: Vec<LibraryCommand>) {
+        for c in cmds {
+            match c {
+                LibraryCommand::Launch(g) => self.launch_game(ctx, &g),
+                LibraryCommand::Favorite(p, v) => {
+                    if let Some(g) = self.state.games.iter().find(|gr| gr.path == p).cloned() {
+                        self.set_favorite(&g, v);
+                    }
+                }
+                LibraryCommand::OpenDetail(p) => {
+                    self.state.selected_view = AppView::GameDetail(p);
+                }
+            }
+        }
+    }
+
     fn render_brand_header(&self, ui: &mut egui::Ui) {
         Frame::none()
             .fill(theme::BG_PANEL)
@@ -291,7 +521,7 @@ impl LauncherApp {
                         .inner_margin(Margin::symmetric(10.0, 6.0))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new("PWR")
+                                RichText::new("HUB")
                                     .monospace()
                                     .strong()
                                     .size(13.0)
@@ -301,13 +531,13 @@ impl LauncherApp {
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("RPI Open Emulator")
+                            RichText::new("RPi Open Emulator")
                                 .strong()
                                 .size(22.0)
                                 .color(theme::TEXT_MAIN),
                         );
                         ui.label(
-                            RichText::new("Biblioteca local + RetroArch — estilo console")
+                            RichText::new("Plataforma de biblioteca retrô — UX estilo consola / Steam")
                                 .size(13.0)
                                 .color(theme::TEXT_DIM),
                         );
@@ -319,107 +549,19 @@ impl LauncherApp {
                             .inner_margin(Margin::symmetric(12.0, 6.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(format!("{} jogos", self.games.len()))
+                                    RichText::new(format!("{} títulos", self.state.games.len()))
                                         .strong()
                                         .color(Color32::BLACK),
                                 );
                             });
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(self.config_path.display().to_string())
                         .small()
                         .color(theme::TEXT_DIM),
                 );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("RetroArch:")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.label(
-                        RichText::new(self.config.retroarch.binary_path.display().to_string())
-                            .small()
-                            .color(theme::ACCENT),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new("ROMs:")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.label(
-                        RichText::new(self.config.library.roms_dir.display().to_string())
-                            .small()
-                            .color(theme::TEXT_MAIN),
-                    );
-                });
-            });
-    }
-
-    fn render_control_bar(&mut self, ui: &mut egui::Ui) {
-        Frame::none()
-            .fill(theme::BG_CARD)
-            .rounding(Rounding::same(10.0))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 58, 82)))
-            .inner_margin(Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if theme::outline_button(ui, "Sincronizar biblioteca", theme::ACCENT).clicked() {
-                        self.sync_library();
-                    }
-                    if theme::outline_button(ui, "Atualizar metadata", theme::WARM).clicked() {
-                        self.refresh_metadata();
-                    }
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    let lib_sel = self.active_view == AppView::Library;
-                    if ui
-                        .selectable_label(
-                            lib_sel,
-                            RichText::new("Biblioteca").color(if lib_sel {
-                                theme::TEXT_MAIN
-                            } else {
-                                theme::TEXT_DIM
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.active_view = AppView::Library;
-                    }
-                    let set_sel = self.active_view == AppView::Settings;
-                    if ui
-                        .selectable_label(
-                            set_sel,
-                            RichText::new("Configuracoes").color(if set_sel {
-                                theme::TEXT_MAIN
-                            } else {
-                                theme::TEXT_DIM
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.active_view = AppView::Settings;
-                        self.settings_draft = SettingsDraft::from_config(&self.config);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(last_game) = self.config.history.last_game_path.as_ref() {
-                            ui.label(
-                                RichText::new(format!("Ultimo: {}", display_file_name(last_game)))
-                                    .small()
-                                    .color(theme::ACCENT),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("Ultimo: —")
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                        }
-                    });
-                });
             });
     }
 
@@ -435,6 +577,29 @@ impl LauncherApp {
             ui.label(RichText::new(" — ").color(theme::TEXT_DIM));
             ui.label(RichText::new(&self.status).color(msg_color));
         });
+    }
+
+    fn render_app_footer(&self, ui: &mut egui::Ui) {
+        let scrape_line = format!(
+            "Scraping: {} | {} jogo(s)",
+            self.scraper_pipeline.describe(),
+            self.state.games.len()
+        );
+        Frame::none()
+            .fill(theme::BG_PANEL)
+            .rounding(Rounding::same(8.0))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(55, 65, 95)))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(scrape_line)
+                            .size(12.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            });
     }
 
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
@@ -467,194 +632,250 @@ impl LauncherApp {
         });
     }
 
-    /// Conteudo rolavel das configuracoes (caminhos, sistemas, novo sistema).
     fn render_settings_scroll_body(&mut self, ui: &mut egui::Ui) {
-        theme::section_heading(ui, "Configuracoes", theme::ACTION);
-        ui.label(
-            RichText::new("Edite e salve sem alterar o TOML manualmente.")
-                .color(theme::TEXT_DIM),
-        );
-        ui.label(
-            RichText::new(
-                "ROMs e BIOS por sistema: dentro das pastas base, use uma subpasta com o nome de cada sistema (ex.: nes, snes, gba).",
-            )
-            .small()
-            .color(theme::TEXT_DIM),
-        );
-        ui.add_space(6.0);
-
-        egui::Grid::new("settings_paths_grid")
-            .num_columns(2)
-            .spacing([14.0, 10.0])
-            .min_col_width(160.0)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("RetroArch - Binario")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.retroarch_binary)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-
-                ui.label(
-                    RichText::new("RetroArch - Pasta de cores")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.cores_dir)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-
-                ui.label(
-                    RichText::new("Biblioteca - Pasta ROMs")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.roms_dir)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-
-                ui.label(
-                    RichText::new("Biblioteca - Pasta BIOS")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.bios_dir)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-            });
-
-        ui.add_space(8.0);
-        ui.separator();
-        theme::section_heading(ui, "Sistemas configurados", theme::ACCENT);
-
-        let mut remove_index: Option<usize> = None;
-        for (index, system) in self.settings_draft.systems.iter_mut().enumerate() {
-            let accent = theme::accent_for_system(&system.key);
-            Frame::none()
-                .fill(theme::BG_PANEL)
-                .rounding(Rounding::same(8.0))
-                .stroke(Stroke::new(1.0, accent.linear_multiply(0.4)))
-                .inner_margin(Margin::symmetric(12.0, 10.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&system.key)
-                                .strong()
-                                .size(15.0)
-                                .color(accent),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::outline_button(
-                                ui,
-                                "Remover",
-                                Color32::from_rgb(255, 120, 130),
-                            )
-                            .clicked()
-                            {
-                                remove_index = Some(index);
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    egui::Grid::new(egui::Id::new("sys_edit").with(index))
-                        .num_columns(2)
-                        .spacing([10.0, 6.0])
-                        .min_col_width(120.0)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Chave").small().color(theme::TEXT_DIM));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut system.key)
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.end_row();
-                            ui.label(RichText::new("Core padrao").small().color(theme::TEXT_DIM));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut system.default_core)
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.end_row();
-                            ui.label(
-                                RichText::new("Extensoes (csv)")
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(
-                                    &mut system.accepted_extensions_csv,
-                                )
-                                .desired_width(ui.available_width()),
-                            );
-                            ui.end_row();
-                            ui.label(
-                                RichText::new("Args extras (csv)")
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut system.extra_args_csv)
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.end_row();
-                        });
-                });
-            ui.add_space(10.0);
-        }
-
-        if let Some(index) = remove_index {
-            if index < self.settings_draft.systems.len() {
-                let removed_key = self.settings_draft.systems[index].key.clone();
-                self.settings_draft.systems.remove(index);
-                self.status = format!("Sistema removido do rascunho: {}", removed_key);
-            }
-        }
-
-        ui.separator();
-        theme::section_heading(ui, "Adicionar sistema", theme::WARM);
-        egui::Grid::new("settings_new_system_grid")
-            .num_columns(2)
-            .spacing([14.0, 10.0])
-            .min_col_width(160.0)
-            .show(ui, |ui| {
-                ui.label(RichText::new("Chave").color(theme::TEXT_DIM));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.new_system_key)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-
-                ui.label(RichText::new("Core padrao").color(theme::TEXT_DIM));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.new_system_core)
-                        .desired_width(ui.available_width()),
-                );
-                ui.end_row();
-
-                ui.label(RichText::new("Extensoes (csv)").color(theme::TEXT_DIM));
-                ui.add(
-                    egui::TextEdit::singleline(
-                        &mut self.settings_draft.new_system_extensions_csv,
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (SettingsTab::Interface, "Interface"),
+                (SettingsTab::LibraryPaths, "Diretórios"),
+                (SettingsTab::EmulatorCores, "Núcleos"),
+                (SettingsTab::Controls, "Controles"),
+            ] {
+                let sel = self.settings_tab == tab;
+                if ui
+                    .selectable_label(
+                        sel,
+                        RichText::new(label).color(if sel {
+                            theme::TEXT_MAIN
+                        } else {
+                            theme::TEXT_DIM
+                        }),
                     )
-                    .desired_width(ui.available_width()),
-                );
-                ui.end_row();
+                    .clicked()
+                {
+                    self.settings_tab = tab;
+                }
+            }
+        });
+        ui.add_space(12.0);
 
-                ui.label(RichText::new("Args extras (csv)").color(theme::TEXT_DIM));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_draft.new_system_args_csv)
-                        .desired_width(ui.available_width()),
+        match self.settings_tab {
+            SettingsTab::Interface => {
+                theme::section_heading(ui, "Interface", theme::ACCENT);
+                ui.label(
+                    RichText::new("Tema visual (presets embutidos).")
+                        .color(theme::TEXT_DIM),
                 );
-                ui.end_row();
-            });
-
-        ui.add_space(8.0);
-        if theme::outline_button(ui, "Adicionar sistema ao rascunho", theme::ACCENT).clicked() {
-            self.add_system_to_draft();
+                ui.add_space(8.0);
+                for t in ThemeId::ALL {
+                    let allowed = self.features.theme_allowed(t);
+                    let mut rt = RichText::new(t.label());
+                    if !allowed {
+                        rt = rt.italics().color(theme::TEXT_DIM);
+                    }
+                    if ui
+                        .selectable_label(self.ui_theme == t && allowed, rt)
+                        .clicked()
+                        && allowed
+                    {
+                        self.ui_theme = t;
+                    }
+                }
+                ui.add_space(14.0);
+                ui.separator();
+                theme::section_heading(ui, "Produto (roadmap)", theme::WARM);
+                ui.label(
+                    RichText::new(
+                        "Gratuito: biblioteca local, metadados offline, temas base.\n\
+                         Premium (futuro): scraping avançado, sync na nuvem, temas exclusivos.",
+                    )
+                    .color(theme::TEXT_DIM),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Plugins registados: {:?}",
+                        self.plugin_host.list_scraper_ids()
+                    ))
+                    .small()
+                    .color(theme::TEXT_DIM),
+                );
+            }
+            SettingsTab::LibraryPaths => {
+                theme::section_heading(ui, "Diretórios da biblioteca", theme::ACTION);
+                ui.label(
+                    RichText::new(
+                        "ROMs e BIOS por sistema: subpastas com o nome de cada sistema (ex.: nes, snes).",
+                    )
+                    .small()
+                    .color(theme::TEXT_DIM),
+                );
+                ui.add_space(8.0);
+                egui::Grid::new("settings_paths_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 10.0])
+                    .min_col_width(160.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("RetroArch — binário").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.retroarch_binary)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("RetroArch — pasta de cores").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.cores_dir)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("Biblioteca — pasta ROMs").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.roms_dir)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("Biblioteca — pasta BIOS").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.bios_dir)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                    });
+            }
+            SettingsTab::EmulatorCores => {
+                theme::section_heading(ui, "Sistemas e núcleos", theme::ACCENT);
+                let mut remove_index: Option<usize> = None;
+                for (index, system) in self.settings_draft.systems.iter_mut().enumerate() {
+                    let accent = theme::accent_for_system(&system.key);
+                    Frame::none()
+                        .fill(theme::BG_PANEL)
+                        .rounding(Rounding::same(8.0))
+                        .stroke(Stroke::new(1.0, accent.linear_multiply(0.4)))
+                        .inner_margin(Margin::symmetric(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&system.key)
+                                        .strong()
+                                        .size(15.0)
+                                        .color(accent),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if theme::outline_button(
+                                            ui,
+                                            "Remover",
+                                            Color32::from_rgb(255, 120, 130),
+                                        )
+                                        .clicked()
+                                        {
+                                            remove_index = Some(index);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(6.0);
+                            egui::Grid::new(egui::Id::new("sys_edit").with(index))
+                                .num_columns(2)
+                                .spacing([10.0, 6.0])
+                                .min_col_width(120.0)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("Chave").small().color(theme::TEXT_DIM));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut system.key)
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.end_row();
+                                    ui.label(
+                                        RichText::new("Core padrão").small().color(theme::TEXT_DIM),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut system.default_core)
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.end_row();
+                                    ui.label(
+                                        RichText::new("Extensões (csv)")
+                                            .small()
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut system.accepted_extensions_csv,
+                                        )
+                                        .desired_width(ui.available_width()),
+                                    );
+                                    ui.end_row();
+                                    ui.label(
+                                        RichText::new("Args extras (csv)")
+                                            .small()
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut system.extra_args_csv)
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+                    ui.add_space(10.0);
+                }
+                if let Some(index) = remove_index {
+                    if index < self.settings_draft.systems.len() {
+                        let removed_key = self.settings_draft.systems[index].key.clone();
+                        self.settings_draft.systems.remove(index);
+                        self.status = format!("Sistema removido do rascunho: {}", removed_key);
+                    }
+                }
+                ui.separator();
+                theme::section_heading(ui, "Adicionar sistema", theme::WARM);
+                egui::Grid::new("settings_new_system_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 10.0])
+                    .min_col_width(160.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Chave").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.new_system_key)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("Core padrão").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.new_system_core)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("Extensões (csv)").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.settings_draft.new_system_extensions_csv,
+                            )
+                            .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                        ui.label(RichText::new("Args extras (csv)").color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_draft.new_system_args_csv)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                if theme::outline_button(ui, "Adicionar sistema ao rascunho", theme::ACCENT).clicked()
+                {
+                    self.add_system_to_draft();
+                }
+            }
+            SettingsTab::Controls => {
+                theme::section_heading(ui, "Controles", theme::ACCENT);
+                ui.label(
+                    RichText::new(
+                        "Mapeamento de comando e atalhos globais — planejado para versão futura.",
+                    )
+                    .color(theme::TEXT_DIM),
+                );
+            }
         }
     }
 
@@ -771,8 +992,8 @@ impl LauncherApp {
                     return;
                 }
                 self.status = format!(
-                    "{} ROM(s) no catalogo ({} atualizada(s) no scan, {} com metadata)",
-                    self.games.len(),
+                    "{} ROM(s) no catálogo ({} atualizada(s) no scan, {} com metadata)",
+                    self.state.games.len(),
                     scanned_count,
                     metadata_updated
                 );
@@ -849,12 +1070,12 @@ impl LauncherApp {
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            let result = launcher::run_retroarch_blocking(
+            let result = run_retroarch_blocking(
                 &config,
                 &rom_path,
                 Some(game_system_key.as_str()),
             );
-            let _ = tx.send(launcher::RetroArchSessionResult { rom_path, result });
+            let _ = tx.send(RetroArchSessionResult { rom_path, result });
             ctx.request_repaint();
         });
     }
@@ -879,9 +1100,10 @@ impl LauncherApp {
     }
 
     fn reload_lists(&mut self) -> anyhow::Result<()> {
-        self.games = self.catalog.list_games()?;
-        self.favorites = self.catalog.list_favorites()?;
-        self.recent = self.catalog.list_recent(10)?;
+        self.state.games = self.catalog.list_games()?;
+        self.state.recent = self.catalog.list_recent(10)?;
+        self.state.recently_added = self.catalog.list_recently_added(16)?;
+        self.state.most_played = self.catalog.list_most_played(16)?;
         Ok(())
     }
 
@@ -900,114 +1122,6 @@ impl LauncherApp {
         }
     }
 
-    fn render_game_row(&mut self, ui: &mut egui::Ui, game: &GameEntry) {
-        let accent = theme::accent_for_system(&game.system_key);
-        Frame::none()
-            .fill(theme::BG_CARD)
-            .rounding(Rounding::same(10.0))
-            .stroke(Stroke::new(1.0, accent.linear_multiply(0.35)))
-            .inner_margin(Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let favorite_mark = if game.is_favorite { "★" } else { "☆" };
-                    ui.label(
-                        RichText::new(favorite_mark)
-                            .size(18.0)
-                            .color(if game.is_favorite {
-                                theme::WARM
-                            } else {
-                                theme::TEXT_DIM
-                            }),
-                    );
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(&game.title)
-                                .strong()
-                                .size(16.0)
-                                .color(theme::TEXT_MAIN),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!(".{}", game.extension))
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.label(RichText::new(" | ").small().color(theme::TEXT_DIM));
-                            ui.label(
-                                RichText::new(&game.system_key)
-                                    .small()
-                                    .strong()
-                                    .color(accent),
-                            );
-                            ui.label(RichText::new(" | ").small().color(theme::TEXT_DIM));
-                            ui.label(
-                                RichText::new(format!("{}x", game.play_count))
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                        });
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if game.is_favorite {
-                            if theme::outline_button(ui, "Desfavoritar", theme::WARM).clicked() {
-                                self.set_favorite(game, false);
-                            }
-                        } else if theme::outline_button(ui, "Favoritar", theme::WARM).clicked() {
-                            self.set_favorite(game, true);
-                        }
-                        ui.add_space(6.0);
-                        if theme::action_button(ui, "  Jogar  ").clicked() {
-                            self.launch_game(ui.ctx(), game);
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!(
-                        "Arquivo: {} | Capa: {} | {} | {}",
-                        game.file_name,
-                        game.cover_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "sem capa".to_string()),
-                        game.metadata_source,
-                        format_last_played_relative(game.last_played_at)
-                    ))
-                    .small()
-                    .color(theme::TEXT_DIM),
-                );
-                if let Some(description) = game.description.as_ref() {
-                    ui.label(
-                        RichText::new(format!("Descricao: {}", description))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-            });
-        ui.add_space(6.0);
-    }
-}
-
-fn format_last_played_relative(ts: Option<i64>) -> String {
-    let Some(ts) = ts else {
-        return "ultimo: nunca".to_string();
-    };
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs() as i64,
-        Err(_) => return format!("ultimo: epoch {}", ts),
-    };
-    let delta = now.saturating_sub(ts);
-    if delta < 60 {
-        return "ultimo: agora ha pouco".to_string();
-    }
-    if delta < 3600 {
-        return format!("ultimo: ha {} min", delta / 60);
-    }
-    if delta < 86400 {
-        return format!("ultimo: ha {} h", delta / 3600);
-    }
-    format!("ultimo: ha {} dia(s)", delta / 86400)
 }
 
 fn parse_csv_values(raw: &str) -> Vec<String> {
@@ -1016,11 +1130,4 @@ fn parse_csv_values(raw: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn display_file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
 }

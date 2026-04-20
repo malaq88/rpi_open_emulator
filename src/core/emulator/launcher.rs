@@ -173,14 +173,12 @@ pub struct RetroArchSessionResult {
     pub result: anyhow::Result<ExitStatus>,
 }
 
-/// Caminho escapado para `system_directory` num ficheiro `.cfg` do RetroArch.
 fn path_for_retroarch_system_cfg(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .replace('"', "\\\"")
 }
 
-/// Monta o comando RetroArch e o ficheiro temporário `--appendconfig` (BIOS por sistema).
 fn build_retroarch_command(
     config: &LauncherConfig,
     rom_path: &Path,
@@ -266,12 +264,6 @@ fn configure_parent_death_signal(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn configure_parent_death_signal(_command: &mut Command) {}
 
-/// Inicia RetroArch e bloqueia até o processo terminar (use apenas em thread de fundo).
-///
-/// No Linux, configura `PR_SET_PDEATHSIG` para SIGTERM: se o launcher for encerrado
-/// (incluindo “Forçar saída” do ambiente), o RetroArch recebe SIGTERM em vez de ficar órfão.
-/// `system_key_override`: usar a chave do catalogo (pasta do sistema); evita ambiguidade entre
-/// plataformas com a mesma extensao (ex.: varias consolas com `.bin`).
 pub fn run_retroarch_blocking(
     config: &LauncherConfig,
     rom_path: &Path,

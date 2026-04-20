@@ -2638,6 +2638,7 @@ dependencies = [
  "eframe",
  "egui",
  "libc",
+ "png",
  "rusqlite",
  "serde",
  "toml",

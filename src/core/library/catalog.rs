@@ -9,6 +9,24 @@ use rusqlite::{Connection, params};
 
 use crate::config::LauncherConfig;
 
+const GAME_ROW_SELECT: &str = "
+                g.path,
+                g.file_name,
+                g.extension,
+                g.system_key,
+                COALESCE(m.title, g.file_name) AS title,
+                m.description,
+                m.cover_path,
+                COALESCE(m.source, 'scanner') AS source,
+                g.is_favorite,
+                g.play_count,
+                g.last_played_at,
+                m.genre,
+                m.release_year,
+                m.developer
+             FROM games g
+             LEFT JOIN game_metadata m ON m.game_path = g.path";
+
 #[derive(Debug, Clone)]
 pub struct GameEntry {
     pub path: PathBuf,
@@ -22,6 +40,9 @@ pub struct GameEntry {
     pub is_favorite: bool,
     pub play_count: i64,
     pub last_played_at: Option<i64>,
+    pub genre: Option<String>,
+    pub release_year: Option<i32>,
+    pub developer: Option<String>,
 }
 
 pub struct Catalog {
@@ -169,70 +190,61 @@ impl Catalog {
     }
 
     pub fn list_games(&self) -> anyhow::Result<Vec<GameEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                g.path,
-                g.file_name,
-                g.extension,
-                g.system_key,
-                COALESCE(m.title, g.file_name) AS title,
-                m.description,
-                m.cover_path,
-                COALESCE(m.source, 'scanner') AS source,
-                g.is_favorite,
-                g.play_count,
-                g.last_played_at
-             FROM games g
-             LEFT JOIN game_metadata m ON m.game_path = g.path
-             ORDER BY file_name COLLATE NOCASE ASC",
-        )?;
+        let sql = format!(
+            "SELECT {} ORDER BY file_name COLLATE NOCASE ASC",
+            GAME_ROW_SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], row_to_game)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_favorites(&self) -> anyhow::Result<Vec<GameEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                g.path,
-                g.file_name,
-                g.extension,
-                g.system_key,
-                COALESCE(m.title, g.file_name) AS title,
-                m.description,
-                m.cover_path,
-                COALESCE(m.source, 'scanner') AS source,
-                g.is_favorite,
-                g.play_count,
-                g.last_played_at
-             FROM games g
-             LEFT JOIN game_metadata m ON m.game_path = g.path
-             WHERE g.is_favorite = 1
-             ORDER BY file_name COLLATE NOCASE ASC",
-        )?;
+        let sql = format!(
+            "SELECT {} WHERE g.is_favorite = 1 ORDER BY file_name COLLATE NOCASE ASC",
+            GAME_ROW_SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], row_to_game)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_recent(&self, limit: i64) -> anyhow::Result<Vec<GameEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                g.path,
-                g.file_name,
-                g.extension,
-                g.system_key,
-                COALESCE(m.title, g.file_name) AS title,
-                m.description,
-                m.cover_path,
-                COALESCE(m.source, 'scanner') AS source,
-                g.is_favorite,
-                g.play_count,
-                g.last_played_at
-             FROM games g
-             LEFT JOIN game_metadata m ON m.game_path = g.path
+        let sql = format!(
+            "SELECT {}
              WHERE g.last_played_at IS NOT NULL
              ORDER BY g.last_played_at DESC
              LIMIT ?1",
-        )?;
+            GAME_ROW_SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit], row_to_game)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_recently_added(&self, limit: i64) -> anyhow::Result<Vec<GameEntry>> {
+        let sql = format!(
+            "SELECT {}
+             ORDER BY g.modified_unix DESC
+             LIMIT ?1",
+            GAME_ROW_SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit], row_to_game)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_most_played(&self, limit: i64) -> anyhow::Result<Vec<GameEntry>> {
+        let sql = format!(
+            "SELECT {}
+             WHERE g.play_count > 0
+             ORDER BY g.play_count DESC,
+                      (g.last_played_at IS NULL) ASC,
+                      g.last_played_at DESC
+             LIMIT ?1",
+            GAME_ROW_SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![limit], row_to_game)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -286,6 +298,23 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_games_recent ON games(last_played_at);
             CREATE INDEX IF NOT EXISTS idx_metadata_game_path ON game_metadata(game_path);",
         )?;
+        self.ensure_metadata_columns()?;
+        Ok(())
+    }
+
+    fn ensure_metadata_columns(&self) -> anyhow::Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(game_metadata)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !cols.iter().any(|c| c == "release_year") {
+            self.conn
+                .execute("ALTER TABLE game_metadata ADD COLUMN release_year INTEGER", [])?;
+        }
+        if !cols.iter().any(|c| c == "developer") {
+            self.conn
+                .execute("ALTER TABLE game_metadata ADD COLUMN developer TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -339,6 +368,9 @@ fn row_to_game(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameEntry> {
         is_favorite: is_favorite_int != 0,
         play_count: row.get(9)?,
         last_played_at: row.get(10)?,
+        genre: row.get(11)?,
+        release_year: row.get(12)?,
+        developer: row.get(13)?,
     })
 }
 
