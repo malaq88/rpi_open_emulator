@@ -1,0 +1,26 @@
+# Cargo — artefatos de build (binarios, deps compiladas)
+/target/
+
+# Backups do rustfmt
+**/*.rs.bk
+
+# MSVC (Windows)
+*.pdb
+
+# Ambiente local
+.env
+.env.*
+
+# IDEs e editores
+.idea/
+*.swp
+*.swo
+*~
+
+# SO
+.DS_Store
+Thumbs.db
+
+# Logs / temporarios
+*.log
+.tmp/

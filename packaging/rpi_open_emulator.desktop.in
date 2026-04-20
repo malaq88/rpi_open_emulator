@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RPI Open Emulator
+GenericName=Central de emulacao
+Comment=Biblioteca local de ROMs com RetroArch
+Exec=@EXEC@
+TryExec=@EXEC@
+Icon=rpi_open_emulator
+Categories=Game;Emulator;
+Keywords=emulator;retroarch;rom;games;
+StartupNotify=true
+Terminal=false

@@ -1,0 +1,23 @@
+[retroarch]
+binary_path = "/usr/bin/retroarch"
+cores_dir = "/usr/lib/libretro"
+extra_args = ["--verbose"]
+
+[library]
+roms_dir = "/home/malack/pi/ROMs"
+bios_dir = "/home/malack/pi/BIOS"
+
+[systems.nes]
+default_core = "nestopia_libretro.so"
+accepted_extensions = ["nes"]
+extra_args = []
+
+[systems.snes]
+default_core = "snes9x_libretro.so"
+accepted_extensions = ["sfc", "smc"]
+extra_args = []
+
+[systems.gba]
+default_core = "mgba_libretro.so"
+accepted_extensions = ["gba"]
+extra_args = []
