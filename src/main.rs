@@ -1,5 +1,6 @@
 mod catalog;
 mod config;
+mod default_systems;
 mod launcher;
 mod theme;
 
@@ -843,11 +844,16 @@ impl LauncherApp {
 
         let config = self.config.clone();
         let rom_path = game.path.clone();
+        let game_system_key = game.system_key.clone();
         let tx = self.game_done_tx.clone();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            let result = launcher::run_retroarch_blocking(&config, &rom_path);
+            let result = launcher::run_retroarch_blocking(
+                &config,
+                &rom_path,
+                Some(game_system_key.as_str()),
+            );
             let _ = tx.send(launcher::RetroArchSessionResult { rom_path, result });
             ctx.request_repaint();
         });

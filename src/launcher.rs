@@ -184,6 +184,7 @@ fn path_for_retroarch_system_cfg(path: &Path) -> String {
 fn build_retroarch_command(
     config: &LauncherConfig,
     rom_path: &Path,
+    system_key_override: Option<&str>,
 ) -> anyhow::Result<(Command, PathBuf)> {
     let extension = rom_path
         .extension()
@@ -191,9 +192,17 @@ fn build_retroarch_command(
         .map(|ext| ext.to_ascii_lowercase())
         .context("arquivo ROM sem extensao reconhecivel")?;
 
-    let system_key = config
-        .resolve_system_key_for_extension(&extension)
-        .with_context(|| format!("nenhum sistema configurado para extensao .{}", extension))?;
+    let system_key = if let Some(key) = system_key_override {
+        let key_norm = key.trim().to_ascii_lowercase();
+        if !config.systems.contains_key(&key_norm) {
+            bail!("sistema '{}' nao existe na configuracao", key_norm);
+        }
+        key_norm
+    } else {
+        config
+            .resolve_system_key_for_extension(&extension)
+            .with_context(|| format!("nenhum sistema configurado para extensao .{}", extension))?
+    };
 
     let expected_rom_root = config.rom_dir_for_system(&system_key);
     if !rom_path.starts_with(&expected_rom_root) {
@@ -261,8 +270,14 @@ fn configure_parent_death_signal(_command: &mut Command) {}
 ///
 /// No Linux, configura `PR_SET_PDEATHSIG` para SIGTERM: se o launcher for encerrado
 /// (incluindo “Forçar saída” do ambiente), o RetroArch recebe SIGTERM em vez de ficar órfão.
-pub fn run_retroarch_blocking(config: &LauncherConfig, rom_path: &Path) -> anyhow::Result<ExitStatus> {
-    let (mut command, cfg_path) = build_retroarch_command(config, rom_path)?;
+/// `system_key_override`: usar a chave do catalogo (pasta do sistema); evita ambiguidade entre
+/// plataformas com a mesma extensao (ex.: varias consolas com `.bin`).
+pub fn run_retroarch_blocking(
+    config: &LauncherConfig,
+    rom_path: &Path,
+    system_key_override: Option<&str>,
+) -> anyhow::Result<ExitStatus> {
+    let (mut command, cfg_path) = build_retroarch_command(config, rom_path, system_key_override)?;
     configure_parent_death_signal(&mut command);
     let outcome = (|| -> anyhow::Result<ExitStatus> {
         let mut child = command.spawn().context("falha ao iniciar RetroArch")?;

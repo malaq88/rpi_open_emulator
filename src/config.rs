@@ -52,6 +52,7 @@ impl LauncherConfig {
             let mut loaded = Self::load_from_file(config_path)?;
             loaded.migrate_legacy_paths_if_needed(config_path)?;
             loaded.migrate_home_pi_library_paths_to_current_user(config_path)?;
+            loaded.merge_missing_libretro_system_defaults(config_path)?;
             loaded.migrate_retroarch_defaults_if_needed(config_path)?;
             return Ok(loaded);
         }
@@ -87,31 +88,7 @@ impl LauncherConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/home/pi"));
 
-        let mut systems = HashMap::new();
-        systems.insert(
-            "nes".to_string(),
-            SystemConfig {
-                default_core: "nestopia_libretro.so".to_string(),
-                accepted_extensions: vec!["nes".to_string()],
-                extra_args: vec![],
-            },
-        );
-        systems.insert(
-            "snes".to_string(),
-            SystemConfig {
-                default_core: "snes9x_libretro.so".to_string(),
-                accepted_extensions: vec!["sfc".to_string(), "smc".to_string()],
-                extra_args: vec![],
-            },
-        );
-        systems.insert(
-            "gba".to_string(),
-            SystemConfig {
-                default_core: "mgba_libretro.so".to_string(),
-                accepted_extensions: vec!["gba".to_string()],
-                extra_args: vec![],
-            },
-        );
+        let systems = crate::default_systems::all_default_systems();
 
         Self {
             retroarch: RetroArchConfig {
@@ -130,7 +107,10 @@ impl LauncherConfig {
 
     pub fn resolve_system_key_for_extension(&self, extension: &str) -> Option<String> {
         let normalized = extension.to_ascii_lowercase();
-        self.systems.iter().find_map(|(system_key, system_config)| {
+        let mut keys: Vec<&String> = self.systems.keys().collect();
+        keys.sort();
+        keys.into_iter().find_map(|system_key| {
+            let system_config = self.systems.get(system_key)?;
             let has_match = system_config
                 .accepted_extensions
                 .iter()
@@ -195,6 +175,22 @@ impl LauncherConfig {
 
     /// Se `library.roms_dir` / `library.bios_dir` apontam para `/home/pi/...` mas o utilizador
     /// atual nao e o `pi`, reescreve para `$HOME/pi/...` (evita Permission denied em `/home/pi`).
+    /// Adiciona sistemas Libretro em falta (novos defaults) sem apagar entradas personalizadas.
+    fn merge_missing_libretro_system_defaults(&mut self, config_path: &Path) -> anyhow::Result<()> {
+        let defaults = crate::default_systems::all_default_systems();
+        let mut changed = false;
+        for (key, value) in defaults {
+            if !self.systems.contains_key(&key) {
+                self.systems.insert(key, value);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_to_file(config_path)?;
+        }
+        Ok(())
+    }
+
     fn migrate_home_pi_library_paths_to_current_user(
         &mut self,
         config_path: &Path,

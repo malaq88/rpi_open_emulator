@@ -47,7 +47,7 @@ Estrutura base:
 
 - `retroarch`: binario, pasta de cores e argumentos globais.
 - `library`: pastas de ROMs e BIOS.
-- `systems.<plataforma>`: `default_core`, extensoes aceitas e args extras.
+- `systems.<plataforma>`: `default_core`, extensoes aceitas e args extras (lista padrao em `src/default_systems.rs`; ao abrir, entradas em falta sao acrescentadas ao `config.toml` sem apagar as tuas).
 
 Exemplo completo em `config/default.toml`.
 

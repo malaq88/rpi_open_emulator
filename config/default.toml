@@ -9,17 +9,10 @@ roms_dir = "/home/malack/pi/ROMs"
 # BIOS: uma subpasta por sistema, ex. <bios_dir>/gba/ — o launcher passa isto ao RetroArch como system_directory
 bios_dir = "/home/malack/pi/BIOS"
 
-[systems.nes]
-default_core = "nestopia_libretro.so"
-accepted_extensions = ["nes"]
-extra_args = []
-
-[systems.snes]
-default_core = "snes9x_libretro.so"
-accepted_extensions = ["sfc", "smc"]
-extra_args = []
-
-[systems.gba]
-default_core = "mgba_libretro.so"
-accepted_extensions = ["gba"]
-extra_args = []
+# A lista completa de sistemas vem de `src/default_systems.rs` (novas instalações e merge ao abrir).
+# Exemplo de uma entrada:
+#
+# [systems.nes]
+# default_core = "nestopia_libretro.so"
+# accepted_extensions = ["nes", "fds"]
+# extra_args = []

@@ -16,12 +16,29 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(160, 170, 195);
 pub const TEXT_MAIN: Color32 = Color32::from_rgb(230, 235, 245);
 
 pub fn accent_for_system(system_key: &str) -> Color32 {
-    match system_key.to_ascii_lowercase().as_str() {
+    let key = system_key.to_ascii_lowercase();
+    match key.as_str() {
         "nes" => Color32::from_rgb(220, 58, 58),
         "snes" => Color32::from_rgb(140, 90, 220),
         "gba" => Color32::from_rgb(80, 120, 255),
-        "genesis" | "md" => Color32::from_rgb(80, 200, 120),
-        _ => Color32::from_rgb(100, 180, 255),
+        "gb" | "gbc" => Color32::from_rgb(90, 160, 90),
+        "genesis" | "mastersystem" | "gamegear" | "segacd" | "sega32x" | "sg1000" => {
+            Color32::from_rgb(80, 200, 120)
+        }
+        "n64" => Color32::from_rgb(40, 120, 255),
+        "nds" => Color32::from_rgb(60, 140, 220),
+        "psx" | "psp" | "ps2" => Color32::from_rgb(180, 180, 220),
+        "dreamcast" | "saturn" => Color32::from_rgb(255, 140, 80),
+        "arcade" | "neogeo" | "fbneo" => Color32::from_rgb(220, 100, 60),
+        "gamecube" | "wii" => Color32::from_rgb(100, 160, 255),
+        "pce" | "supergrafx" | "pcfx" => Color32::from_rgb(200, 80, 140),
+        _ => {
+            let n = key.bytes().fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c as u32));
+            let r = 90 + (n % 110) as u8;
+            let g = 110 + ((n >> 7) % 90) as u8;
+            let b = 130 + ((n >> 14) % 90) as u8;
+            Color32::from_rgb(r, g, b)
+        }
     }
 }
 
