@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus},
 };
 
 use anyhow::{Context, bail};
@@ -166,7 +166,25 @@ fn package_hint_for_system(system_key: &str) -> &'static str {
     }
 }
 
-pub fn launch_game(config: &LauncherConfig, rom_path: &Path) -> anyhow::Result<()> {
+/// Resultado de uma sessão RetroArch executada fora da thread da UI.
+#[derive(Debug)]
+pub struct RetroArchSessionResult {
+    pub rom_path: PathBuf,
+    pub result: anyhow::Result<ExitStatus>,
+}
+
+/// Caminho escapado para `system_directory` num ficheiro `.cfg` do RetroArch.
+fn path_for_retroarch_system_cfg(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace('"', "\\\"")
+}
+
+/// Monta o comando RetroArch e o ficheiro temporário `--appendconfig` (BIOS por sistema).
+fn build_retroarch_command(
+    config: &LauncherConfig,
+    rom_path: &Path,
+) -> anyhow::Result<(Command, PathBuf)> {
     let extension = rom_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -177,6 +195,15 @@ pub fn launch_game(config: &LauncherConfig, rom_path: &Path) -> anyhow::Result<(
         .resolve_system_key_for_extension(&extension)
         .with_context(|| format!("nenhum sistema configurado para extensao .{}", extension))?;
 
+    let expected_rom_root = config.rom_dir_for_system(&system_key);
+    if !rom_path.starts_with(&expected_rom_root) {
+        bail!(
+            "ROM deve estar em {} (subpasta do sistema '{}')",
+            expected_rom_root.display(),
+            system_key
+        );
+    }
+
     let system = config
         .systems
         .get(&system_key)
@@ -184,17 +211,63 @@ pub fn launch_game(config: &LauncherConfig, rom_path: &Path) -> anyhow::Result<(
 
     let core_path = resolve_core_path(config, &system_key, system)?;
     let retroarch_binary = resolve_retroarch_binary(config)?;
-    let mut command = Command::new(&retroarch_binary);
 
+    let bios_dir = config.bios_dir_for_system(&system_key);
+    fs::create_dir_all(&bios_dir).with_context(|| {
+        format!(
+            "nao foi possivel criar a pasta de BIOS do sistema: {}",
+            bios_dir.display()
+        )
+    })?;
+
+    let cfg_path = env::temp_dir().join(format!(
+        "rpi_open_emulator_retroarch_{}.cfg",
+        std::process::id()
+    ));
+    let bios_escaped = path_for_retroarch_system_cfg(&bios_dir);
+    fs::write(
+        &cfg_path,
+        format!("system_directory = \"{bios_escaped}\"\n"),
+    )
+    .with_context(|| format!("gravar appendconfig em {}", cfg_path.display()))?;
+
+    let mut command = Command::new(&retroarch_binary);
+    command.arg("--appendconfig").arg(&cfg_path);
     command.arg("-L").arg(&core_path);
     command.args(&config.retroarch.extra_args);
     command.args(&system.extra_args);
     command.arg(rom_path);
 
-    let status = command.status().context("falha ao iniciar RetroArch")?;
-    if !status.success() {
-        bail!("RetroArch retornou codigo {:?}", status.code());
-    }
+    Ok((command, cfg_path))
+}
 
-    Ok(())
+#[cfg(target_os = "linux")]
+fn configure_parent_death_signal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_parent_death_signal(_command: &mut Command) {}
+
+/// Inicia RetroArch e bloqueia até o processo terminar (use apenas em thread de fundo).
+///
+/// No Linux, configura `PR_SET_PDEATHSIG` para SIGTERM: se o launcher for encerrado
+/// (incluindo “Forçar saída” do ambiente), o RetroArch recebe SIGTERM em vez de ficar órfão.
+pub fn run_retroarch_blocking(config: &LauncherConfig, rom_path: &Path) -> anyhow::Result<ExitStatus> {
+    let (mut command, cfg_path) = build_retroarch_command(config, rom_path)?;
+    configure_parent_death_signal(&mut command);
+    let outcome = (|| -> anyhow::Result<ExitStatus> {
+        let mut child = command.spawn().context("falha ao iniciar RetroArch")?;
+        child.wait().context("falha ao aguardar RetroArch")
+    })();
+    let _ = fs::remove_file(&cfg_path);
+    outcome
 }

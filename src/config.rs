@@ -51,6 +51,7 @@ impl LauncherConfig {
         if config_path.exists() {
             let mut loaded = Self::load_from_file(config_path)?;
             loaded.migrate_legacy_paths_if_needed(config_path)?;
+            loaded.migrate_home_pi_library_paths_to_current_user(config_path)?;
             loaded.migrate_retroarch_defaults_if_needed(config_path)?;
             return Ok(loaded);
         }
@@ -142,6 +143,35 @@ impl LauncherConfig {
         })
     }
 
+    /// `<roms_dir>/<chave_do_sistema>/` — onde ficam as ROMs desse sistema.
+    pub fn rom_dir_for_system(&self, system_key: &str) -> PathBuf {
+        self.library.roms_dir.join(system_key)
+    }
+
+    /// `<bios_dir>/<chave_do_sistema>/` — onde ficam as BIOS desse sistema (RetroArch `system_directory`).
+    pub fn bios_dir_for_system(&self, system_key: &str) -> PathBuf {
+        self.library.bios_dir.join(system_key)
+    }
+
+    /// Pastas de ROMs a sincronizar: uma entrada por sistema configurado (ordenado por chave).
+    pub fn rom_scan_pairs_sorted(&self) -> Vec<(String, PathBuf)> {
+        let mut keys: Vec<String> = self.systems.keys().cloned().collect();
+        keys.sort();
+        keys
+            .into_iter()
+            .map(|k| (k.clone(), self.rom_dir_for_system(&k)))
+            .collect()
+    }
+
+    /// Cria `<roms_dir>/<sistema>/` e `<bios_dir>/<sistema>/` para cada sistema na configuração.
+    pub fn ensure_system_library_dirs(&self) -> std::io::Result<()> {
+        for key in self.systems.keys() {
+            fs::create_dir_all(self.rom_dir_for_system(key))?;
+            fs::create_dir_all(self.bios_dir_for_system(key))?;
+        }
+        Ok(())
+    }
+
     fn migrate_legacy_paths_if_needed(&mut self, config_path: &Path) -> anyhow::Result<()> {
         let legacy_roms_path = Path::new("/home/pi/ROMs");
         if self.library.roms_dir != legacy_roms_path {
@@ -157,6 +187,44 @@ impl LauncherConfig {
 
         if let Some(new_path) = discovered {
             self.library.roms_dir = new_path;
+            self.save_to_file(config_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Se `library.roms_dir` / `library.bios_dir` apontam para `/home/pi/...` mas o utilizador
+    /// atual nao e o `pi`, reescreve para `$HOME/pi/...` (evita Permission denied em `/home/pi`).
+    fn migrate_home_pi_library_paths_to_current_user(
+        &mut self,
+        config_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+            return Ok(());
+        };
+        if home == Path::new("/home/pi") {
+            return Ok(());
+        }
+
+        let legacy_home_pi = Path::new("/home/pi");
+        let mut changed = false;
+
+        if self.library.roms_dir.starts_with(legacy_home_pi) {
+            if let Ok(rest) = self.library.roms_dir.strip_prefix(legacy_home_pi) {
+                let rest = rest.strip_prefix("/").unwrap_or(rest);
+                self.library.roms_dir = home.join("pi").join(rest);
+                changed = true;
+            }
+        }
+        if self.library.bios_dir.starts_with(legacy_home_pi) {
+            if let Ok(rest) = self.library.bios_dir.strip_prefix(legacy_home_pi) {
+                let rest = rest.strip_prefix("/").unwrap_or(rest);
+                self.library.bios_dir = home.join("pi").join(rest);
+                changed = true;
+            }
+        }
+
+        if changed {
             self.save_to_file(config_path)?;
         }
 

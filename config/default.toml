@@ -4,7 +4,9 @@ cores_dir = "/usr/lib/libretro"
 extra_args = ["--verbose"]
 
 [library]
+# ROMs: uma subpasta por sistema, ex. <roms_dir>/nes/, <roms_dir>/snes/
 roms_dir = "/home/malack/pi/ROMs"
+# BIOS: uma subpasta por sistema, ex. <bios_dir>/gba/ — o launcher passa isto ao RetroArch como system_directory
 bios_dir = "/home/malack/pi/BIOS"
 
 [systems.nes]

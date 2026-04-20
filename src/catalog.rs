@@ -51,48 +51,61 @@ impl Catalog {
         let scan_id = now_unix_secs();
         let mut scanned_count: usize = 0;
         let root = config.library.roms_dir.clone();
-        let mut stack = vec![root.clone()];
 
-        while let Some(current_dir) = stack.pop() {
-            let read_dir = fs::read_dir(&current_dir)
-                .with_context(|| format!("falha ao ler diretorio {}", current_dir.display()))?;
+        for (system_key, root_dir) in config.rom_scan_pairs_sorted() {
+            let Some(system_cfg) = config.systems.get(&system_key) else {
+                continue;
+            };
+            if !root_dir.is_dir() {
+                continue;
+            }
 
-            for entry in read_dir {
-                let path = entry?.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !path.is_file() {
-                    continue;
-                }
+            let mut stack = vec![root_dir];
 
-                let extension = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.to_ascii_lowercase());
-                let Some(extension) = extension else {
-                    continue;
-                };
+            while let Some(current_dir) = stack.pop() {
+                let read_dir = fs::read_dir(&current_dir)
+                    .with_context(|| format!("falha ao ler diretorio {}", current_dir.display()))?;
 
-                let Some(system_key) = config.resolve_system_key_for_extension(&extension) else {
-                    continue;
-                };
+                for entry in read_dir {
+                    let path = entry?.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !path.is_file() {
+                        continue;
+                    }
 
-                let metadata = fs::metadata(&path).with_context(|| {
-                    format!("falha ao obter metadados da ROM {}", path.display())
-                })?;
-                let modified_unix = metadata
-                    .modified()
-                    .ok()
-                    .and_then(to_unix_secs)
-                    .unwrap_or(scan_id);
-                let size_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-                let path_text = path.to_string_lossy().to_string();
-                let file_name = file_name_for_path(&path);
+                    let extension = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase());
+                    let Some(extension) = extension else {
+                        continue;
+                    };
 
-                self.conn.execute(
-                    "INSERT INTO games (
+                    let accepted = system_cfg
+                        .accepted_extensions
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(&extension));
+                    if !accepted {
+                        continue;
+                    }
+
+                    let metadata = fs::metadata(&path).with_context(|| {
+                        format!("falha ao obter metadados da ROM {}", path.display())
+                    })?;
+                    let modified_unix = metadata
+                        .modified()
+                        .ok()
+                        .and_then(to_unix_secs)
+                        .unwrap_or(scan_id);
+                    let size_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+                    let path_text = path.to_string_lossy().to_string();
+                    let file_name = file_name_for_path(&path);
+
+                    self.conn.execute(
+                        "INSERT INTO games (
                         path,
                         file_name,
                         extension,
@@ -108,23 +121,24 @@ impl Catalog {
                         modified_unix = excluded.modified_unix,
                         size_bytes = excluded.size_bytes,
                         last_scan_id = excluded.last_scan_id",
-                    params![
-                        path_text,
-                        file_name,
-                        extension,
-                        system_key,
-                        modified_unix,
-                        size_bytes,
-                        scan_id
-                    ],
-                )?;
-                self.upsert_offline_metadata(
-                    &path,
-                    &file_name,
-                    &system_key,
-                    &config.library.roms_dir,
-                )?;
-                scanned_count += 1;
+                        params![
+                            path_text,
+                            file_name,
+                            extension,
+                            system_key,
+                            modified_unix,
+                            size_bytes,
+                            scan_id
+                        ],
+                    )?;
+                    self.upsert_offline_metadata(
+                        &path,
+                        &file_name,
+                        &system_key,
+                        &config.library.roms_dir,
+                    )?;
+                    scanned_count += 1;
+                }
             }
         }
 

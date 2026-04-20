@@ -139,10 +139,11 @@ Se um pacote nao existir com esse nome exato, use o pacote sugerido pelo `apt` o
 
 ## Fluxo MVP implementado
 
-- escanear ROMs em `library.roms_dir`;
-- mapear extensao para plataforma em `systems.<plataforma>.accepted_extensions`;
+- escanear ROMs em subpastas por sistema: `library.roms_dir/<sistema>/` (nome da chave em `systems`, ex. `nes`, `snes`);
+- BIOS por sistema em `library.bios_dir/<sistema>/`, passada ao RetroArch como `system_directory` via `--appendconfig`;
+- validar extensao do ficheiro face a `systems.<sistema>.accepted_extensions` na pasta desse sistema;
 - resolver core com `systems.<plataforma>.default_core`;
-- executar RetroArch com `-L <core> <rom>`;
+- executar RetroArch com `--appendconfig` (BIOS), `-L <core> <rom>`;
 - persistir `history.last_game_path` ao finalizar o jogo.
 
 ## Fase 2 implementada
