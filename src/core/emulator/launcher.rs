@@ -179,6 +179,75 @@ fn path_for_retroarch_system_cfg(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
+/// `$HOME` em Unix; em Windows costuma ser `%USERPROFILE%`.
+fn user_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+/// Caminhos habituais do `retroarch.cfg` do utilizador (Linux + Flatpak + Windows).
+fn retroarch_main_cfg_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(home) = user_home_dir() {
+        v.push(home.join(".config/retroarch/retroarch.cfg"));
+        v.push(
+            home.join(".var/app/org.libretro.RetroArch/config/retroarch/retroarch.cfg"),
+        );
+        #[cfg(windows)]
+        v.push(home.join("AppData/Roaming/RetroArch/retroarch.cfg"));
+    }
+    v
+}
+
+fn first_existing_retroarch_main_cfg() -> Option<PathBuf> {
+    retroarch_main_cfg_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Pastas com perfis `*.cfg` do autoconfig (ordem: preferir config do utilizador, depois sistema).
+fn joypad_autoconfig_candidate_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(home) = user_home_dir() {
+        v.push(home.join(".config/retroarch/autoconfig"));
+        v.push(
+            home.join(".var/app/org.libretro.RetroArch/config/retroarch/autoconfig"),
+        );
+        #[cfg(windows)]
+        v.push(home.join("AppData/Roaming/RetroArch/autoconfig"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        v.extend([
+            PathBuf::from("/usr/share/libretro/autoconfig"),
+            PathBuf::from("/usr/share/retroarch/autoconfig"),
+            PathBuf::from("/usr/lib/libretro/autoconfig"),
+            PathBuf::from("/usr/local/share/libretro/autoconfig"),
+        ]);
+    }
+    v
+}
+
+fn first_existing_autoconfig_dir() -> Option<PathBuf> {
+    joypad_autoconfig_candidate_dirs()
+        .into_iter()
+        .find(|p| p.is_dir())
+}
+
+/// Trechos extra para `--appendconfig`: deteção de comandos + diretório de perfis conhecido.
+fn build_appendconfig_snippet(bios_escaped: &str) -> String {
+    let mut cfg = format!("system_directory = \"{bios_escaped}\"\n");
+    // Liga autoconfig por perfis (vendor/product/device); requer ficheiros em joypad_autoconfig_dir.
+    cfg.push_str("input_autodetect_enable = \"true\"\n");
+    if let Some(dir) = first_existing_autoconfig_dir() {
+        let esc = path_for_retroarch_system_cfg(&dir);
+        cfg.push_str(&format!("joypad_autoconfig_dir = \"{esc}\"\n"));
+    }
+    cfg
+}
+
 fn build_retroarch_command(
     config: &LauncherConfig,
     rom_path: &Path,
@@ -232,13 +301,14 @@ fn build_retroarch_command(
         std::process::id()
     ));
     let bios_escaped = path_for_retroarch_system_cfg(&bios_dir);
-    fs::write(
-        &cfg_path,
-        format!("system_directory = \"{bios_escaped}\"\n"),
-    )
-    .with_context(|| format!("gravar appendconfig em {}", cfg_path.display()))?;
+    let append_snippet = build_appendconfig_snippet(&bios_escaped);
+    fs::write(&cfg_path, &append_snippet)
+        .with_context(|| format!("gravar appendconfig em {}", cfg_path.display()))?;
 
     let mut command = Command::new(&retroarch_binary);
+    if let Some(main_cfg) = first_existing_retroarch_main_cfg() {
+        command.arg("--config").arg(main_cfg);
+    }
     command.arg("--appendconfig").arg(&cfg_path);
     command.arg("-L").arg(&core_path);
     // Inicia em tela cheia; argumentos extra em `retroarch.extra_args` podem sobrescrever (ex.: `--windowed`).
